@@ -1,0 +1,963 @@
+﻿using Microsoft.Extensions.Logging;
+using Mosaik.Core;
+using Catalyst.Models;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
+using System.IO.Compression;
+using System.Reflection;
+using MessagePack;
+
+namespace Catalyst
+{
+    /// <summary>
+    /// Represents the data associated with a <see cref="Pipeline"/>.
+    /// </summary>
+    [FormerName("Mosaik.NLU", "PipelineModelData")]
+    public class PipelineData : StorableObjectData
+    {
+        /// <summary>Gets or sets the list of stored object info for processes in the pipeline.</summary>
+        public List<StoredObjectInfo> Processes { get; set; }
+    }
+
+    /// <summary>
+    /// Represents a processing pipeline for documents, consisting of multiple processing steps.
+    /// </summary>
+    public class Pipeline : StorableObject<Pipeline, PipelineData>, ICanUpdateModel
+    {
+        internal static readonly MessagePackSerializerOptions LZ4Standard = MessagePackSerializerOptions.Standard.WithCompression(MessagePackCompression.Lz4Block);
+        private List<IProcess> Processes { get; set; } = new List<IProcess>();
+        private Dictionary<Language, Neuralyzer> Neuralyzers { get; set; } = new Dictionary<Language, Neuralyzer>();
+
+        private ReaderWriterLockSlim RWLock = new ReaderWriterLockSlim();
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="Pipeline"/> class.
+        /// </summary>
+        /// <param name="language">The language of the pipeline.</param>
+        /// <param name="version">The version of the pipeline.</param>
+        /// <param name="tag">The tag of the pipeline.</param>
+        public Pipeline(Language language = Language.Any, int version = 0, string tag = "") : base(language, version, tag)
+        {
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="Pipeline"/> class with the specified processes.
+        /// </summary>
+        /// <param name="processes">The list of processes to include in the pipeline.</param>
+        /// <param name="language">The language of the pipeline.</param>
+        /// <param name="version">The version of the pipeline.</param>
+        /// <param name="tag">The tag of the pipeline.</param>
+        public Pipeline(IList<IProcess> processes, Language language = Language.Any, int version = 0, string tag = "") : this(language, version, tag)
+        {
+            Processes = processes.ToList();
+        }
+
+        /// <summary>
+        /// Asynchronously loads a pipeline from the store.
+        /// </summary>
+        /// <param name="language">The language.</param>
+        /// <param name="version">The version.</param>
+        /// <param name="tag">The tag.</param>
+        /// <returns>A task that represents the asynchronous operation, containing the loaded pipeline.</returns>
+        public new static async Task<Pipeline> FromStoreAsync(Language language, int version, string tag)
+        {
+            var pipeline = new Pipeline(language, version, tag);
+            await pipeline.LoadDataAsync();
+            var set = new HashSet<string>();
+
+            foreach (var md in pipeline.Data.Processes.ToArray()) //Copy here as we'll modify the list bellow if model not found
+            {
+                if (await md.ExistsAsync())
+                {
+                    try
+                    {
+                        if (set.Add(md.ToStringWithoutVersion()))
+                        {
+                            var process = (IProcess)await md.FromStoreAsync();
+                            pipeline.Add(process);
+                        }
+                    }
+                    catch (FileNotFoundException)
+                    {
+                        Logger.LogWarning($"Model not found on disk, ignoring: {md}");
+                        pipeline.Data.Processes.Remove(md);
+                    }
+                }
+                else
+                {
+                    pipeline.Data.Processes.Remove(md);
+                }
+            }
+
+            if (!pipeline.Processes.Any(p => p is ITokenizer))
+            {
+                pipeline.AddToBegin(new FastTokenizer(language)); //Fix bug that removed all tokenizers from the pipelines due to missing ExistsAsync
+            }
+
+            return pipeline;
+        }
+
+        /// <summary>
+        /// Packs the pipeline and all its models into a single ZIP stream.
+        /// </summary>
+        /// <param name="outputStream">The stream to write to.</param>
+        public void PackTo(Stream outputStream)
+        {
+            UpdateProcessData();
+            using (var zip = new ZipArchive(outputStream, ZipArchiveMode.Create,leaveOpen: true))
+            {
+                var infoEntry = zip.CreateEntry("info.bin");
+                using (var s = infoEntry.Open())
+                {
+                    MessagePack.MessagePackSerializer.Serialize(s, new StoredObjectInfo(typeof(Pipeline).FullName, Language, Version, Tag), LZ4Standard);
+                }
+
+                var pipeEntry = zip.CreateEntry("pipeline.bin");
+                using(var s = pipeEntry.Open())
+                {
+                    MessagePack.MessagePackSerializer.Serialize(s, Data, LZ4Standard);
+                }
+
+                foreach (var process in Processes)
+                {
+                    var dataProperty = process.GetType().GetProperty(nameof(Spotter.Data)); //Uses spotter just to get the name of the .Data property from StorableObject<,> instead of hard-coding
+                    if (dataProperty is object)
+                    {
+                        if (dataProperty.GetValue(process, null) is StorableObjectData data)
+                        {
+                            var type = data.GetType();
+                            var correctType = Convert.ChangeType(data, type);
+
+                            var entry = zip.CreateEntry(new StoredObjectInfo(process).ToString() + ".bin");
+                            using (var s = entry.Open())
+                            {
+                                MessagePack.MessagePackSerializer.Serialize(s, correctType, LZ4Standard);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Asynchronously loads a pipeline from a packed ZIP stream.
+        /// </summary>
+        /// <param name="inputStream">The packed stream to read from.</param>
+        /// <returns>A task that represents the asynchronous operation, containing the loaded pipeline.</returns>
+        public static async Task<Pipeline> LoadFromPackedAsync(Stream inputStream)
+        {
+            using (var zip = new ZipArchive(inputStream, ZipArchiveMode.Read, leaveOpen: true))
+            {
+                var infoEntry = zip.GetEntry("info.bin");
+                StoredObjectInfo info;
+                using (var s = infoEntry.Open())
+                {
+                    info = MessagePack.MessagePackSerializer.Deserialize<StoredObjectInfo>(s, LZ4Standard);
+                }
+
+                var pipeline = new Pipeline(info.Language, info.Version, info.Tag);
+
+                var pipeEntry = zip.GetEntry("pipeline.bin");
+                using (var s = pipeEntry.Open())
+                {
+                    pipeline.Data = MessagePack.MessagePackSerializer.Deserialize<PipelineData>(s, LZ4Standard);
+                }
+
+                foreach(var process in pipeline.Data.Processes)
+                {
+                    if (ObjectStore.TryGetType(process.ModelType, out var type))
+                    {
+                        object model = null;
+
+                        foreach (var constructorInfo in type.GetConstructors().Concat(type.GetConstructors(BindingFlags.Instance | BindingFlags.NonPublic)))
+                        {
+                            var parameters = constructorInfo.GetParameters();
+                            if (parameters.Length == 3
+                                && parameters[0].ParameterType == typeof(Language)
+                                && parameters[1].ParameterType == typeof(int)
+                                && parameters[2].ParameterType == typeof(string))
+                            {
+                                //Found a good one
+                                model = constructorInfo.Invoke(new object[] { process.Language, process.Version, process.Tag });
+                                break;
+                            }
+
+                            if (parameters.Length == 2
+                                && parameters[0].ParameterType == typeof(Language)
+                                && parameters[1].ParameterType == typeof(int))
+                            {
+                                //Found a good one
+                                model = constructorInfo.Invoke(new object[] { process.Language, process.Version });
+                                break;
+                            }
+                            if (parameters.Length == 1
+                                && parameters[0].ParameterType == typeof(Language))
+                            {
+                                //Found a good one
+                                model = constructorInfo.Invoke(new object[] { process.Language });
+                                break;
+                            }
+                        }
+
+                        var dataProperty = model.GetType().GetProperty(nameof(Spotter.Data)); //Uses spotter just to get the name of the .Data property from StorableObject<,> instead of hard-coding
+                        if(dataProperty is object)
+                        {
+                            var entry = zip.GetEntry(process.ToString() + ".bin");
+                            using (var s = entry.Open())
+                            using (var ms = new MemoryStream())
+                            {
+                                await s.CopyToAsync(ms);
+                                var bytes = ms.ToArray();
+
+                                var deserializer = SerializationHelper.CreateDeserializer(dataProperty.PropertyType);
+                                var modelData = deserializer.Invoke(bytes);
+
+                                dataProperty.GetSetMethod().Invoke(model, new[] { modelData });
+                            }
+                        }
+
+                        if (model is object)
+                        {
+                            pipeline.Add((IProcess)model);
+                        }
+                    }
+                }
+
+                return pipeline;
+            }
+        }
+
+        /// <summary>
+        /// Asynchronously checks if a pipeline in the store contains a specific model.
+        /// </summary>
+        /// <param name="language">The language of the pipeline.</param>
+        /// <param name="version">The version of the pipeline.</param>
+        /// <param name="tag">The tag of the pipeline.</param>
+        /// <param name="model">The model information to check for.</param>
+        /// <param name="matchVersion">Whether to match the version exactly.</param>
+        /// <returns>A task that represents the asynchronous operation, containing a boolean indicating whether the model exists in the pipeline.</returns>
+        public static async Task<bool> CheckIfHasModelAsync(Language language, int version, string tag, StoredObjectInfo model, bool matchVersion = true)
+        {
+            var a = new Pipeline(language, version, tag);
+            await a.LoadDataAsync();
+            return a.Data.Processes.Any(p => p.Language == model.Language && p.ModelType == model.ModelType && p.Tag == model.Tag && (!matchVersion || p.Version == model.Version));
+        }
+
+        /// <inheritdoc />
+        public override async Task StoreAsync()
+        {
+            UpdateProcessData();
+            await base.StoreAsync();
+        }
+
+        private void UpdateProcessData()
+        {
+            Data.Processes = new List<StoredObjectInfo>();
+            var set = new HashSet<string>();
+            foreach (var p in Processes)
+            {
+                var md = new StoredObjectInfo(p.Type, p.Language, p.Version, p.Tag);
+                if (set.Add(md.ToStringWithoutVersion()))
+                {
+                    Data.Processes.Add(md);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Adds a special case to all tokenizers in the pipeline.
+        /// </summary>
+        /// <param name="word">The word to add as a special case.</param>
+        /// <param name="exception">The tokenization exception details.</param>
+        public void AddSpecialCase(string word, TokenizationException exception)
+        {
+            foreach (var p in Processes)
+            {
+                if (p is FastTokenizer st)
+                {
+                    st.AddSpecialCase(word, exception);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Registers a neuralyzer to be used in the pipeline.
+        /// </summary>
+        /// <param name="neuralyzer">The neuralyzer to use.</param>
+        /// <returns>The current pipeline instance.</returns>
+        public Pipeline UseNeuralyzer(Neuralyzer neuralyzer)
+        {
+            RWLock.EnterWriteLock();
+            try
+            {
+                Neuralyzers[neuralyzer.Language] = neuralyzer;
+                return this;
+            }
+            finally
+            {
+                RWLock.ExitWriteLock();
+            }
+        }
+
+        /// <summary>
+        /// Registers multiple neuralyzers to be used in the pipeline.
+        /// </summary>
+        /// <param name="neuralyzeres">The collection of neuralyzers to use.</param>
+        /// <returns>The current pipeline instance.</returns>
+        public Pipeline UseNeuralyzers(IEnumerable<Neuralyzer> neuralyzeres)
+        {
+            RWLock.EnterWriteLock();
+            try
+            {
+                Neuralyzers.Clear();
+                foreach (var n in neuralyzeres)
+                {
+                    Neuralyzers[n.Language] = n;
+                }
+                return this;
+            }
+            finally
+            {
+                RWLock.ExitWriteLock();
+            }
+        }
+
+        /// <summary>
+        /// Removes all registered neuralyzers from the pipeline.
+        /// </summary>
+        public void RemoveAllNeuralizers()
+        {
+            RWLock.EnterWriteLock();
+            try
+            {
+                Neuralyzers.Clear();
+            }
+            finally
+            {
+                RWLock.ExitWriteLock();
+            }
+        }
+
+        private void TryImportSpecialCases(IProcess process)
+        {
+            if (process is IHasSpecialCases || process is IHasSimpleSpecialCases)
+            {
+                foreach (FastTokenizer st in Processes.Where(p => p is FastTokenizer))
+                {
+                    if (process.Language == Language.Any || st.Language == process.Language)
+                    {
+                        st.ImportSpecialCases(process);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Adds a process to the beginning of the pipeline.
+        /// </summary>
+        /// <param name="process">The process to add.</param>
+        /// <returns>The current pipeline instance.</returns>
+        public Pipeline AddToBegin(IProcess process)
+        {
+            RWLock.EnterWriteLock();
+            try
+            {
+                var tmp = Processes.ToList();
+                Processes.Clear();
+                Processes.Add(process);
+                Processes.AddRange(tmp);
+                TryImportSpecialCases(process);
+            }
+            finally
+            {
+                RWLock.ExitWriteLock();
+            }
+            return this;
+        }
+
+        /// <summary>
+        /// Removes all processes that match the specified predicate.
+        /// </summary>
+        /// <param name="p">The predicate to match.</param>
+        public void RemoveAll(Predicate<IProcess> p)
+        {
+            RWLock.EnterWriteLock();
+
+            try
+            {
+                Processes.RemoveAll(p);
+            }
+            finally
+            {
+                RWLock.ExitWriteLock();
+            }
+        }
+
+        /// <summary>
+        /// Asynchronously adds a process to the pipeline from a task.
+        /// </summary>
+        /// <param name="modelLoadTask">The task that loads the process.</param>
+        /// <returns>A task that represents the asynchronous operation, containing the updated pipeline.</returns>
+        public async Task<Pipeline> AddAsync(Task<IProcess> modelLoadTask) => Add(await modelLoadTask);
+
+        /// <summary>
+        /// Adds a process to the pipeline, maintaining a logical order (Normalizers, Tokenizers, SentenceDetectors, Taggers, others).
+        /// </summary>
+        /// <param name="process">The process to add.</param>
+        /// <returns>The current pipeline instance.</returns>
+        public Pipeline Add(IProcess process)
+        {
+            RWLock.EnterWriteLock();
+            try
+            {
+                //Ensure correct order when adding new processes
+
+                var normalizers       = Processes.Where(p => p is INormalizer).ToList();
+                var tokenizers        = Processes.Where(p => p is ITokenizer).ToList();
+                var sentenceDetectors = Processes.Where(p => p is ISentenceDetector).ToList();
+                var taggers           = Processes.Where(p => p is ITagger).ToList();
+                var others            = Processes.Except(normalizers).Except(taggers).Except(tokenizers).Except(sentenceDetectors).ToList();
+
+                if (process is INormalizer)
+                {
+                    normalizers.Add(process);
+                }
+                else if (process is ITokenizer)
+                {
+                    tokenizers.Add(process);
+                }
+                else if (process is ITagger)
+                {
+                    taggers.Add(process);
+                }
+                else if (process is ISentenceDetector)
+                {
+                    sentenceDetectors.Add(process);
+                }
+                else
+                {
+                    others.Add(process);
+                }
+
+                Processes = normalizers.Concat(tokenizers).Concat(sentenceDetectors).Concat(taggers).Concat(others).ToList();
+
+                TryImportSpecialCases(process);
+            }
+            finally
+            {
+                RWLock.ExitWriteLock();
+            }
+            return this;
+        }
+
+        /// <summary>
+        /// Triggers memory optimization for all processes in the pipeline that support it.
+        /// </summary>
+        public void OptimizeMemory()
+        {
+            RWLock.EnterWriteLock();
+            try
+            {
+                foreach (var process in Processes)
+                {
+                    if (process is ICanOptimizeMemory canOptimizeProcess) 
+                    { 
+                        canOptimizeProcess.OptimizeMemory(); 
+                    }
+                }
+            }
+            finally
+            {
+                RWLock.ExitWriteLock();
+            }
+        }
+
+        /// <summary>
+        /// Replaces the current pipeline's processes and version with those from another pipeline.
+        /// </summary>
+        /// <param name="newPipeline">The new pipeline to use.</param>
+        public void ReplaceWith(Pipeline newPipeline)
+        {
+            RWLock.EnterWriteLock();
+            try
+            {
+                Data.Processes = newPipeline.Data.Processes.ToList();
+                Processes = newPipeline.Processes.ToList();
+                Version = newPipeline.Version;
+            }
+            finally
+            {
+                RWLock.ExitWriteLock();
+            }
+        }
+
+        /// <summary>
+        /// Creates a default pipeline for the specified language.
+        /// </summary>
+        /// <param name="language">The language.</param>
+        /// <param name="sentenceDetector">Whether to include a sentence detector.</param>
+        /// <param name="tagger">Whether to include a part-of-speech tagger.</param>
+        /// <returns>A <see cref="Pipeline"/> instance.</returns>
+        public static Pipeline For(Language language, bool sentenceDetector = true, bool tagger = true)
+        {
+            return ForAsync(language, sentenceDetector, tagger).WaitResult();
+        }
+
+        /// <summary>
+        /// Asynchronously creates a default pipeline for the specified language.
+        /// </summary>
+        /// <param name="language">The language.</param>
+        /// <param name="sentenceDetector">Whether to include a sentence detector.</param>
+        /// <param name="tagger">Whether to include a part-of-speech tagger.</param>
+        /// <returns>A task that represents the asynchronous operation, containing the created pipeline.</returns>
+        public static async Task<Pipeline> ForAsync(Language language, bool sentenceDetector = true, bool tagger = true)
+        {
+            var p = await TokenizerForAsync(language, sentenceDetector);
+            if (tagger && language != Language.Any && language != Language.Unknown) { p.Add(await AveragePerceptronTagger.FromStoreAsync(language, 0, "")); }
+            return p;
+        }
+
+        /// <summary>
+        /// Asynchronously creates a pipeline that supports multiple languages.
+        /// </summary>
+        /// <param name="languages">The collection of languages to support.</param>
+        /// <param name="sentenceDetector">Whether to include a sentence detector for each language.</param>
+        /// <param name="tagger">Whether to include a part-of-speech tagger for each language.</param>
+        /// <returns>A task that represents the asynchronous operation, containing the created pipeline.</returns>
+        public static async Task<Pipeline> ForManyAsync(IEnumerable<Language> languages, bool sentenceDetector = true, bool tagger = true)
+        {
+            var processes = new List<IProcess>();
+            foreach (var language in languages)
+            {
+                var tmp = await TokenizerForAsync(language, sentenceDetector);
+                processes.AddRange(tmp.Processes);
+                if (tagger) { processes.Add(await AveragePerceptronTagger.FromStoreAsync(language, -1, "")); }
+            }
+            var p = new Pipeline(processes) { Language = Language.Any };
+            return p;
+        }
+
+        /// <summary>
+        /// Creates a pipeline with only a tokenizer (and optionally a sentence detector) for the specified language.
+        /// </summary>
+        /// <param name="language">The language.</param>
+        /// <param name="sentenceDetector">Whether to include a sentence detector.</param>
+        /// <returns>A <see cref="Pipeline"/> instance.</returns>
+        public static Pipeline TokenizerFor(Language language, bool sentenceDetector = true)
+        {
+            return TokenizerForAsync(language, sentenceDetector).WaitResult();
+        }
+
+        /// <summary>
+        /// Asynchronously creates a pipeline with only a tokenizer (and optionally a sentence detector) for the specified language.
+        /// </summary>
+        /// <param name="language">The language.</param>
+        /// <param name="sentenceDetector">Whether to include a sentence detector.</param>
+        /// <returns>A task that represents the asynchronous operation, containing the created pipeline.</returns>
+        public static async Task<Pipeline> TokenizerForAsync(Language language, bool sentenceDetector = true)
+        {
+            var p = new Pipeline() { Language = language };
+            p.Add(new FastTokenizer(language));
+
+            if (sentenceDetector)
+            {
+                IProcess sd = null;
+
+                try
+                {
+                    //Uses english sentence detector as a default
+                    sd = await SentenceDetector.FromStoreAsync((language == Language.Any) ? Language.English : language, -1, "");
+                    p.Add(sd);
+                }
+                catch
+                {
+                    Logger.LogWarning("Could not find sentence detector model for language {LANGUAGE}. Falling back to english model", language);
+                }
+
+                if (sd is null)
+                {
+                    try
+                    {
+                        sd = await SentenceDetector.FromStoreAsync(Language.English, -1, "");
+                        p.Add(sd);
+                    }
+                    catch
+                    {
+                        Logger.LogWarning("Could not find sentence detector model for language {LANGUAGE}. Continuing without one", Language.English);
+                    }
+                }
+            }
+
+            return p;
+        }
+
+        /// <summary>
+        /// Processes a single document through all steps in the pipeline.
+        /// </summary>
+        /// <param name="document">The document to process.</param>
+        /// <param name="cancellationToken">A cancellation token.</param>
+        /// <returns>The processed document.</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public IDocument ProcessSingle(IDocument document, CancellationToken cancellationToken = default)
+        {
+            RWLock.EnterReadLock();
+            try
+            {
+                return ProcessSingleWithoutLocking(document, cancellationToken);
+            }
+            finally
+            {
+                RWLock.ExitReadLock();
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private IDocument ProcessSingleWithoutLocking(IDocument document, CancellationToken cancellationToken = default)
+        {
+            if (document.Length > 0)
+            {
+                foreach (var p in Processes)
+                {
+                    if (p.Language != Language.Any && document.Language != Language.Any && p.Language != document.Language) { continue; }
+                    p.Process(document);
+                }
+
+                //Apply any neuralizer registered for any language, or the document language
+                if (Neuralyzers.TryGetValue(Language.Any, out var neuralyzerAny)) { neuralyzerAny.Process(document); }
+                if (Neuralyzers.TryGetValue(document.Language, out var neuralyzerLang)) { neuralyzerLang.Process(document); }
+            }
+            return document;
+        }
+
+        /// <summary>
+        /// Processes a single document through only the entity recognition steps of the pipeline (any <see cref="IEntityRecognizer"/>
+        /// process plus the registered neuralyzers), skipping normalizers, tokenizers, sentence detectors and taggers.
+        /// </summary>
+        /// <remarks>
+        /// The document must already be tokenized by the caller - nothing here creates spans or tokens. Recognizers that use
+        /// part-of-speech features (such as <see cref="Catalyst.Models.AveragePerceptronEntityRecognizer"/>) see whatever tags the
+        /// document carries, so a document that was not tagged gives them less to work with.
+        /// </remarks>
+        /// <param name="document">The document to process.</param>
+        /// <param name="cancellationToken">A cancellation token.</param>
+        /// <returns>The processed document.</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public IDocument ProcessSingleEntityRecognitionOnly(IDocument document, CancellationToken cancellationToken = default)
+        {
+            RWLock.EnterReadLock();
+            try
+            {
+                return ProcessSingleEntityRecognitionOnlyWithoutLocking(document, cancellationToken);
+            }
+            finally
+            {
+                RWLock.ExitReadLock();
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private IDocument ProcessSingleEntityRecognitionOnlyWithoutLocking(IDocument document, CancellationToken cancellationToken = default)
+        {
+            if (document.Length > 0)
+            {
+                foreach (var p in Processes)
+                {
+                    if (!(p is IEntityRecognizer)) { continue; }
+                    if (p.Language != Language.Any && document.Language != Language.Any && p.Language != document.Language) { continue; }
+                    p.Process(document, cancellationToken);
+                }
+
+                //Apply any neuralizer registered for any language, or the document language
+                if (Neuralyzers.TryGetValue(Language.Any, out var neuralyzerAny)) { neuralyzerAny.Process(document); }
+                if (Neuralyzers.TryGetValue(document.Language, out var neuralyzerLang)) { neuralyzerLang.Process(document); }
+            }
+            return document;
+        }
+
+        /// <summary>
+        /// Processes a collection of documents using a single thread.
+        /// </summary>
+        /// <param name="documents">The documents to process.</param>
+        /// <param name="throwOnError">Whether to throw an exception if an error occurs during processing.</param>
+        /// <param name="cancellationToken">A cancellation token.</param>
+        /// <returns>An enumerable of processed documents.</returns>
+        public IEnumerable<IDocument> ProcessSingleThread(IEnumerable<IDocument> documents, bool throwOnError = false, CancellationToken cancellationToken = default)
+        {
+            RWLock.EnterReadLock();
+
+            var sw = Stopwatch.StartNew();
+            long docsCount = 0, spansCount = 0, tokensCount = 0;
+
+            Logger.LogTrace("Started pipeline single thread processing");
+
+            var buffer = new List<IDocument>();
+
+            foreach (var block in documents.Split(1000))
+            {
+                RWLock.EnterReadLock(); //Acquire the read lock only for the duration of the block processing, not during the yield return
+                try
+                {
+                    foreach (var doc in block)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+
+                        IDocument d;
+                        try
+                        {
+                            d = ProcessSingleWithoutLocking(doc, cancellationToken);
+
+                            Interlocked.Add(ref spansCount, doc.SpansCount);
+                            Interlocked.Add(ref tokensCount, doc.TokensCount);
+
+                            if (Interlocked.Increment(ref docsCount) % 10_000 == 0)
+                            {
+                                var elapsed = sw.Elapsed.TotalSeconds;
+                                var kts = tokensCount / elapsed / 1000;
+                                Logger.LogInformation("Parsed {DOCS} documents, {SPANS} sentences and {TOKENS} tokens in {ELAPSED:0.00} seconds at {KTS} kTokens/second", docsCount, spansCount, tokensCount, (int)elapsed, (int)kts);
+                            }
+                        }
+                        catch (Exception E)
+                        {
+                            if (throwOnError) 
+                            { 
+                                throw E; 
+                            } 
+                            else
+                            {
+                                d = null;
+                            }
+                        }
+
+                        if (d is object)
+                        {
+                            buffer.Add(d);
+                        }
+                    }
+                }
+                finally
+                {
+                    RWLock.ExitReadLock(); //Return the lock here, otherwise we don't have control due to the yield return pattern
+                }
+
+                foreach(var d in block)
+                {
+                    yield return d;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Processes a collection of documents using multiple threads.
+        /// </summary>
+        /// <param name="documents">The documents to process.</param>
+        /// <param name="parallelOptions">Parallel options to control the execution.</param>
+        /// <returns>An enumerable of processed documents.</returns>
+        public IEnumerable<IDocument> Process(IEnumerable<IDocument> documents, ParallelOptions parallelOptions = default)
+        {
+            var sw = Stopwatch.StartNew();
+            long docsCount = 0, spansCount = 0, tokensCount = 0;
+            double kts;
+
+            var enumerator = documents.GetEnumerator();
+            var buffer = new List<IDocument>();
+
+            parallelOptions = parallelOptions ?? new ParallelOptions();
+
+            using (var m = new Measure(Logger, "Parsing documents", logOnlyDuration:true))
+            {
+                while (enumerator.MoveNext())
+                {
+                    buffer.Add(enumerator.Current);
+
+                    if (buffer.Count >= 10_000)
+                    {
+
+                        RWLock.EnterReadLock(); //Acquire the read lock only for the duration of the processing, not during the yield return
+                        try
+                        {
+                            Parallel.ForEach(buffer, parallelOptions, (doc) => ProcessSingleWithoutLocking(doc, parallelOptions.CancellationToken));
+                        }
+                        finally
+                        {
+                            RWLock.ExitReadLock(); //Return the lock here, otherwise we don't have control due to the yield return pattern
+                        }
+
+                        foreach (var doc in buffer) { spansCount += doc.SpansCount; tokensCount += doc.TokensCount; docsCount++; yield return doc; }
+                        buffer.Clear();
+                        kts = (double)tokensCount / m.ElapsedSeconds / 1000;
+                        m.SetOperations(docsCount).EmitPartial($"{kts:n0} kTokens/second, found {spansCount:n0} sentences and {tokensCount:n0} tokens");
+                    }
+                }
+
+                RWLock.EnterReadLock(); //Acquire the read lock only for the duration of the processing, not during the yield return
+                try
+                {
+                    //Process any remaining
+                    Parallel.ForEach(buffer, parallelOptions, (doc) => ProcessSingleWithoutLocking(doc, parallelOptions.CancellationToken));
+                }
+                finally
+                {
+                    RWLock.ExitReadLock(); //Return the lock here, otherwise we don't have control due to the yield return pattern
+                }
+
+                foreach (var doc in buffer) { spansCount += doc.SpansCount; tokensCount += doc.TokensCount; docsCount++; yield return doc; }
+                buffer.Clear();
+                kts = (double)tokensCount / m.ElapsedSeconds / 1000;
+                m.SetOperations(docsCount).EmitPartial($"{kts:n0} kTokens/second, found {spansCount:n0} sentences and {tokensCount:n0} tokens");
+            }
+        }
+
+        /// <summary>
+        /// Gets a list of all models (processes) in the pipeline.
+        /// </summary>
+        /// <returns>A list of <see cref="IModel"/>.</returns>
+        public IList<IModel> GetModelsList()
+        {
+            RWLock.EnterReadLock();
+            try
+            {
+                return Processes.Select(p => (IModel)p).ToList();
+            }
+            finally
+            {
+                RWLock.ExitReadLock();
+            }
+        }
+
+        /// <summary>
+        /// Gets a list of information about all models in the pipeline.
+        /// </summary>
+        /// <returns>A list of <see cref="StoredObjectInfo"/>.</returns>
+        public List<StoredObjectInfo> GetModelsDescriptions()
+        {
+            RWLock.EnterReadLock();
+            try
+            {
+                return Processes.Select(p => new StoredObjectInfo(p.Type, p.Language, p.Version, p.Tag)).ToList();
+            }
+            finally
+            {
+                RWLock.ExitReadLock();
+            }
+        }
+
+        /// <summary>
+        /// Gets a list of all possible entity types that can be recognized by the pipeline.
+        /// </summary>
+        /// <returns>A list of models and the entity types they produce.</returns>
+        public IReadOnlyList<(StoredObjectInfo Model, string[] EntityTypes)> GetPossibleEntityTypes()
+        {
+            RWLock.EnterReadLock();
+            try
+            {
+                var list = new List<(StoredObjectInfo Model, string[] EntityTypes)>();
+                foreach (var p in Processes)
+                {
+                    if (p is IEntityRecognizer ire)
+                    {
+                        var md = new StoredObjectInfo(ire);
+                        list.Add((md, ire.Produces()));
+                    }
+                }
+                return list;
+            }
+            finally
+            {
+                RWLock.ExitReadLock();
+            }
+        }
+
+        /// <summary>
+        /// Checks if the pipeline contains a model matching the specified information.
+        /// </summary>
+        /// <param name="model">The model information to check for.</param>
+        /// <param name="matchVersion">Whether to match the version exactly.</param>
+        /// <returns>True if the model exists in the pipeline, false otherwise.</returns>
+        public bool HasModel(StoredObjectInfo model, bool matchVersion = true)
+        {
+            RWLock.EnterReadLock();
+
+            try
+            {
+                return Processes.Any(p => p.Language == model.Language && p.Type == model.ModelType && p.
+                Tag == model.Tag && (!matchVersion || p.Version == model.Version));
+            }
+            finally
+            {
+                RWLock.ExitReadLock();
+            }
+        }
+
+        /// <summary>
+        /// Removes any model matching the specified information from the pipeline.
+        /// </summary>
+        /// <param name="model">The model information to match for removal.</param>
+        /// <returns>True if any model was removed, false otherwise.</returns>
+        public bool RemoveModel(StoredObjectInfo model)
+        {
+            //Removes any model matching the description, independent of the version
+            RWLock.EnterReadLock();
+
+            try
+            {
+                return Processes.RemoveAll(p => p.Language == model.Language && p.Type == model.ModelType && p.Tag == model.Tag) > 0;
+            }
+            finally
+            {
+                RWLock.ExitReadLock();
+            }
+        }
+
+        /// <inheritdoc />
+        public bool HasModelToUpdate(StoredObjectInfo newModel)
+        {
+            RWLock.EnterReadLock();
+
+            try
+            {
+                return Processes.Any(p => p.Language == newModel.Language && p.Type == newModel.ModelType && p.Tag == newModel.Tag && p.Version < newModel.Version);
+            }
+            finally
+            {
+                RWLock.ExitReadLock();
+            }
+        }
+
+        /// <inheritdoc />
+        public void UpdateModel(StoredObjectInfo newModel, object modelToBeUpdated)
+        {
+            if (modelToBeUpdated is IProcess process)
+            {
+                RWLock.EnterWriteLock();
+
+                try
+                {
+                    var toBeReplaced = Processes.FirstOrDefault(p => p.Language == newModel.Language && p.Type == newModel.ModelType && p.Tag == newModel.Tag && p.Version < newModel.Version);
+
+                    if (toBeReplaced is object)
+                    {
+                        var index = Processes.IndexOf(toBeReplaced);
+                        if (index >= 0)
+                        {
+                            Processes[index] = process;
+                        }
+                    }
+                }
+                finally
+                {
+                    RWLock.ExitWriteLock();
+                }
+            }
+            else
+            {
+                throw new InvalidOperationException("Invalid model to update");
+            }
+        }
+    }
+}

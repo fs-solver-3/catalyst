@@ -1,0 +1,76 @@
+variables:
+  solution: '**/*.sln'
+  projects:  '**/Languages/**/*.csproj'
+  buildPlatform: 'Any CPU'
+  buildConfiguration: 'Release'
+  targetVersion: yy.M.$(build.buildId)
+
+trigger:
+  branches:
+    include:
+    - master
+  paths:
+    include:
+    - Languages
+    - azure-devops/build-models.yml
+
+pool:
+  vmImage: 'ubuntu-22.04'
+
+steps:
+- checkout: self
+  lfs: true
+
+- task: NuGetToolInstaller@1
+
+- task: PowerShell@2
+  displayName: 'Create CalVer Version'
+  inputs:
+    targetType: 'inline'
+    script: |
+      $dottedDate = (Get-Date).ToString("yy.M")
+      $buildID = $($env:BUILD_BUILDID) 
+      $modBuildID = [int]$buildID % 65536  # ensure fits in int16
+      $newTargetVersion = "$dottedDate.$modBuildID"
+      Write-Host "##vso[task.setvariable variable=targetVersion;]$newTargetVersion"
+      Write-Host "Updated targetVersion to '$newTargetVersion'"
+
+- task: UseDotNet@2
+  displayName: 'Use .NET 10.0 SDK'
+  inputs:
+    packageType: sdk
+    version: 10.x
+    includePreviewVersions: true
+    installationPath: $(Agent.ToolsDirectory)/dotnet
+
+- task: DotNetCoreCLI@2
+  displayName: 'restore nuget'
+  inputs:
+    command: 'restore'
+    projects: '$(projects)'
+
+- task: DotNetCoreCLI@2
+  displayName: 'build projects'
+  inputs:
+    command: 'build'
+    projects: '$(projects)'
+    arguments: '-c $(buildConfiguration) /p:Version=$(targetVersion)  /p:AllowUnsafeBlocks=True /p:LangVersion=latest'
+
+- task: DotNetCoreCLI@2
+  displayName: 'pack projects'
+  inputs:
+    command: 'pack'
+    packagesToPack: '$(projects)'
+    versioningScheme: 'off'
+    configuration: 'Release'
+    buildProperties: 'Version="$(targetVersion)";AllowUnsafeBlocks="True";LangVersion="latest"'
+    verbosityPack: 'Diagnostic'
+    nobuild: true
+
+- task: NuGetCommand@2
+  displayName: 'push nuget'
+  inputs:
+    command: 'push'
+    packagesToPush: '$(Build.ArtifactStagingDirectory)/**/*.nupkg'
+    nuGetFeedType: 'external'
+    publishFeedCredentials: 'nuget-curiosity-org'

@@ -1,0 +1,169 @@
+﻿//using MessagePack;
+
+using Mosaik.Core;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace Catalyst.Models
+{
+    [FormerName("Mosaik.NLU.Models", "VectorizerLanguageDetectorModel")]
+    public class FastTextLanguageDetectorData : StorableObjectData
+    {
+    }
+
+    [FormerName("Mosaik.NLU.Models", "VectorizerLanguageDetector")]
+    public class FastTextLanguageDetector : StorableObject<FastTextLanguageDetector, FastTextLanguageDetectorData>, IProcess
+    {
+        private SpaceTokenizer Tokenizer;
+        private FastText Model;
+        private NumberToWordNormalizer NumberNormalizer = new NumberToWordNormalizer() { ReplacementText = "" };
+
+        public FastTextLanguageDetector(int version) : base(Language.Any, version, nameof(FastTextLanguageDetector), compress: false)
+        {
+            Model = new FastText(Language.Any, version, "language-detector");
+            Model.Data.Type = FastText.ModelType.Supervised;
+            Model.Data.MaximumWordNgrams = 0;
+            Model.Data.MinimumNgrams = 2;
+            Model.Data.MaximumNgrams = 5;
+            Model.Data.VectorQuantization = QuantizationType.None;
+            Model.Data.LearningRate = 0.1f;
+            Model.Data.Epoch = 50;
+            Model.Data.Dimensions = 16;
+            Model.Data.IgnoreCase = false;
+            Model.Data.Loss = FastText.LossType.NegativeSampling;
+            Model.Data.MinimumCount = 5;
+
+            Tokenizer = new SpaceTokenizer();
+        }
+
+        public static Task<FastTextLanguageDetector> LoadAsync(int version)
+        {
+            return FromStoreAsync(Language.Any, version, "");
+        }
+
+        public new static async Task<FastTextLanguageDetector> FromStoreAsync(Language language, int version, string tag)
+        {
+            var a = new FastTextLanguageDetector(version);
+
+            //Because we use the model name as the tag of this model, we've to check for formernames here
+            try
+            {
+                await a.LoadDataAsync();
+            }
+            catch (FileNotFoundException)
+            {
+                if (ObjectStore.TryGetFormerNames(nameof(FastTextLanguageDetector), out var formerNames))
+                {
+                    var correctTag = a.Tag;
+                    foreach (var formerName in formerNames)
+                    {
+                        try
+                        {
+                            a.Tag = formerName;
+                            await a.LoadDataAsync();
+                            a.Tag = correctTag;
+                            break;
+                        }
+                        catch (FileNotFoundException)
+                        {
+                            //ignore
+                        }
+                    }
+                }
+            }
+
+            a.Model = await FastText.FromStoreAsync_Internal(Language.Any, version, "language-detector");
+            a.Model?.CompactSupervisedModel();
+
+            return a;
+        }
+
+        public new static async Task<bool> DeleteAsync(Language language, int version, string tag)
+        {
+            var a = new FastTextLanguageDetector(version);
+            bool deleted = false;
+            deleted |= await FastText.DeleteAsync(Language.Any, version, "language-detector");
+            deleted |= await a.DeleteDataAsync();
+            return deleted;
+        }
+
+        public void Process(IDocument document, CancellationToken cancellationToken = default)
+        {
+            if (document.Length == 0 || (document.Language != Language.Unknown && document.Language != Language.Any)) { return; } //Don't try to identify documents that already have their language set or is empty
+
+            IDocument tempDocument = Prepare(document);
+
+            try
+            {
+                var tag = Model.PredictMax(tempDocument, 200);
+                if (tag.label is null)
+                {
+                    document.Language = Language.Unknown;
+                }
+                else
+                {
+                    document.Language = Languages.CodeToEnum(tag.label);
+                }
+            }
+            catch
+            {
+                document.Language = Language.Unknown;
+            }
+        }
+
+        public Dictionary<Language, float> Predict(IDocument document)
+        {
+            IDocument tempDocument = Prepare(document);
+
+            try
+            {
+                var predictions = Model.Predict(tempDocument);
+                return predictions.ToDictionary(kv => Languages.CodeToEnum(kv.Key), kv => kv.Value);
+            }
+            catch
+            {
+                return new Dictionary<Language, float>()
+                {
+                    [Language.Unknown] = 1f
+                };
+            }
+        }
+
+        private IDocument Prepare(IDocument document)
+        {
+            IDocument tempDocument = document;
+
+            if (document.SpansCount == 0) // Have to tokenize temporarily the document
+            {
+                //Sliced as memory, so a long document is not copied just to look at its first 1000 chars
+                if (document.Length > 1000)
+                {
+                    tempDocument = new Document(document.ValueMemory.Slice(0, 1000));
+                }
+                else
+                {
+                    tempDocument = new Document(document.ValueMemory);
+                }
+                Tokenizer.Process(tempDocument);
+                NumberNormalizer.Process(tempDocument);
+            }
+
+            return tempDocument;
+        }
+
+        public void Train(IEnumerable<IDocument> documents)
+        {
+            Model.Train(documents);
+        }
+
+        public override async Task StoreAsync()
+        {
+            Model.CompactSupervisedModel();
+            await Model.StoreAsync();
+            await base.StoreAsync();
+        }
+    }
+}
